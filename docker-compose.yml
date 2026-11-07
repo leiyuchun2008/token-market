@@ -1,0 +1,95 @@
+# Token/API 算力交易平台：一台机器跑全部
+#   postgres  平台数据库
+#   redis     New API 的缓存
+#   mysql     New API 的数据库（New API 也能用 PostgreSQL，但官方镜像对 MySQL 最稳）
+#   new-api   转发引擎（买方的 /v1 接口、卖方 Key 的渠道都在这里）
+#   api       平台后端（FastAPI）
+#   nginx     对外：/api/* -> api，/v1/* -> new-api，其余 -> 前端（等前端做好再加）
+# 先 cp .env.example .env 并填好密码，再 docker compose up -d
+name: token-market
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tm-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: token_market
+      POSTGRES_USER: tm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tm -d token_market"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: tm-redis
+    restart: always
+
+  mysql:
+    image: mysql:8.0
+    container_name: tm-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: new-api
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+
+  new-api:
+    image: calciumion/new-api:${NEWAPI_IMAGE_TAG:-latest}
+    container_name: tm-new-api
+    restart: always
+    command: --log-dir /app/logs
+    environment:
+      - SQL_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(mysql:3306)/new-api
+      - REDIS_CONN_STRING=redis://redis
+      - SESSION_SECRET=${NEWAPI_SESSION_SECRET:?set NEWAPI_SESSION_SECRET in .env}
+      - TZ=Asia/Shanghai
+      - ERROR_LOG_ENABLED=true
+    volumes:
+      - ./data/new-api:/data
+      - ./data/new-api-logs:/app/logs
+    depends_on:
+      - mysql
+      - redis
+
+  api:
+    build: ./backend
+    container_name: tm-api
+    restart: always
+    environment:
+      - ENV=${ENV:-prod}
+      - DATABASE_URL=postgresql://tm:${POSTGRES_PASSWORD}@postgres:5432/token_market
+      - NEWAPI_BASE_URL=http://new-api:3000
+      - NEWAPI_TOKEN=${NEWAPI_TOKEN:-}
+      - PUBLIC_API_BASE=${PUBLIC_API_BASE:-https://api.example.com/v1}
+      - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in .env}
+      - KEY_ENCRYPTION_KEY=${KEY_ENCRYPTION_KEY:?set KEY_ENCRYPTION_KEY in .env}
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
+      - TZ=Asia/Shanghai
+    depends_on:
+      postgres:
+        condition: service_healthy
+      new-api:
+        condition: service_started
+
+  nginx:
+    image: nginx:alpine
+    container_name: tm-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx:/etc/nginx/conf.d:ro
+      - ./deploy/site:/usr/share/nginx/html:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - api
+      - new-api
