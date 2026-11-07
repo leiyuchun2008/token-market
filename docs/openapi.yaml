@@ -1,0 +1,888 @@
+openapi: 3.1.0
+info:
+  title: Token/API 算力交易平台 · 接口设计 v1
+  version: 0.1.0
+  description: |
+    五组接口，分别给不同调用方：
+      1. **gateway**  兼容 OpenAI 格式的 API 中转网关，买方程序直接调用，鉴权用平台子密钥 `Authorization: Bearer sk-plat-...`
+      2. **buyer**    买方控制台：子密钥、钱包、充值、用量
+      3. **seller**   卖方控制台：Key 托管、挂单、收益、结算、提现、保证金
+      4. **admin**    平台后台：审核、定价、风控、配置
+      5. **public**   无需登录：模型市场、状态页、首页动态
+    控制台接口鉴权用登录后的 JWT（`Authorization: Bearer <jwt>`）。
+    所有列表接口支持 `page`、`page_size`（默认 20，最大 100），返回 `{ items, total, page, page_size }`。
+    所有错误返回 `{ error: { code, message, request_id } }`。
+servers:
+  - url: https://api.example.com
+    description: 网关与控制台同域，网关路径以 /v1 开头，控制台以 /api 开头
+
+tags:
+  - name: gateway
+  - name: auth
+  - name: buyer
+  - name: seller
+  - name: admin
+  - name: public
+
+paths:
+  # =====================================================================
+  # 1. 网关（OpenAI 兼容）
+  # =====================================================================
+  /v1/models:
+    get:
+      tags: [gateway]
+      summary: 该子密钥可用的模型列表（OpenAI 格式）
+      security: [{ apiToken: [] }]
+      responses:
+        '200': { description: OK }
+
+  /v1/chat/completions:
+    post:
+      tags: [gateway]
+      summary: 文本对话（OpenAI 兼容，支持 stream）
+      description: |
+        处理流程：
+          1. 校验子密钥、模型白名单、速率限制
+          2. 估算成本 × reserve_ratio，检查余额并预留（余额不足返回 402）
+          3. 按路由算法选一个 listing（见 README「路由与计费」），解密其 Key，转发到上游
+          4. 上游返回 401/403/429/5xx/超时 → 该 Key 记一次失败，切下一个 listing，最多重试 3 次
+          5. 成功后按真实用量计费：写 usage_logs，扣买方余额，记卖方应得
+          6. 响应头带 `X-Plat-Request-Id`，不暴露任何卖方信息
+      security: [{ apiToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, messages]
+              properties:
+                model: { type: string, example: doubao-seed-1-6 }
+                messages: { type: array, items: { type: object } }
+                stream: { type: boolean, default: false }
+                max_tokens: { type: integer }
+                temperature: { type: number }
+      responses:
+        '200': { description: OpenAI 格式响应 }
+        '402': { description: 余额不足 }
+        '429': { description: 平台侧限流 }
+        '503': { description: 该模型暂无可用卖方 }
+
+  /v1/videos/generations:
+    post:
+      tags: [gateway]
+      summary: 视频生成任务创建（Seedance 等，异步）
+      description: 创建任务时按最大时长预留余额；任务完成回调后按实际秒数计费并释放多余预留。
+      security: [{ apiToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, prompt]
+              properties:
+                model: { type: string, example: seedance-1-0-pro }
+                prompt: { type: string }
+                image_url: { type: string, description: 图生视频时的首帧 }
+                duration: { type: integer, description: 秒, default: 5 }
+                resolution: { type: string, enum: [480p, 720p, 1080p] }
+                ratio: { type: string, example: '16:9' }
+      responses:
+        '202':
+          description: 任务已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_id: { type: string }
+                  status: { type: string, enum: [queued, running] }
+
+  /v1/videos/generations/{task_id}:
+    get:
+      tags: [gateway]
+      summary: 查询视频任务
+      security: [{ apiToken: [] }]
+      parameters: [{ name: task_id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: 任务状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_id: { type: string }
+                  status: { type: string, enum: [queued, running, succeeded, failed] }
+                  video_url: { type: string }
+                  duration: { type: number }
+                  cost_cny: { type: number }
+
+  /v1/images/generations:
+    post:
+      tags: [gateway]
+      summary: 图片生成（OpenAI 兼容）
+      security: [{ apiToken: [] }]
+      responses:
+        '200': { description: OK }
+
+  /v1/embeddings:
+    post:
+      tags: [gateway]
+      summary: 向量嵌入（OpenAI 兼容）
+      security: [{ apiToken: [] }]
+      responses:
+        '200': { description: OK }
+
+  /v1/usage:
+    get:
+      tags: [gateway]
+      summary: 该子密钥的用量与余额（给买方程序做自检）
+      security: [{ apiToken: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  balance_cny: { type: number }
+                  today_cost_cny: { type: number }
+                  quota_limit: { type: number, nullable: true }
+                  quota_used: { type: number }
+
+  # =====================================================================
+  # 2. 认证
+  # =====================================================================
+  /api/auth/register:
+    post:
+      tags: [auth]
+      summary: 注册（邮箱或手机 + 验证码），可带邀请码
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nickname, password]
+              properties:
+                nickname: { type: string }
+                email: { type: string }
+                phone: { type: string }
+                verify_code: { type: string }
+                password: { type: string }
+                invite_code: { type: string }
+                role: { type: string, enum: [buyer, seller, both], default: buyer }
+      responses:
+        '201': { description: 返回 JWT }
+  /api/auth/login:
+    post:
+      tags: [auth]
+      summary: 登录
+      responses:
+        '200': { description: 返回 JWT }
+  /api/auth/me:
+    get:
+      tags: [auth]
+      summary: 当前用户信息、角色、信用分
+      security: [{ jwt: [] }]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  # =====================================================================
+  # 3. 买方控制台
+  # =====================================================================
+  /api/buyer/tokens:
+    get:
+      tags: [buyer]
+      summary: 我的子密钥列表（只显示前缀）
+      security: [{ jwt: [] }]
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [buyer]
+      summary: 创建子密钥（明文只返回这一次）
+      security: [{ jwt: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                allowed_models: { type: array, items: { type: string } }
+                quota_limit: { type: number }
+                rate_limit_rpm: { type: integer }
+                expires_at: { type: string, format: date-time }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  token: { type: string, example: sk-plat-ab12cd34ef56... }
+  /api/buyer/tokens/{id}:
+    patch:
+      tags: [buyer]
+      summary: 修改配额/白名单/启停
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+    delete:
+      tags: [buyer]
+      summary: 吊销子密钥
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: OK } }
+
+  /api/buyer/wallet:
+    get:
+      tags: [buyer]
+      summary: 余额、冻结、今日消费
+      security: [{ jwt: [] }]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Wallet' }
+
+  /api/buyer/topups:
+    get:
+      tags: [buyer]
+      summary: 充值记录
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+    post:
+      tags: [buyer]
+      summary: 提交充值单（V1 线下转账 + 上传凭证，后台审核到账）
+      security: [{ jwt: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, pay_method]
+              properties:
+                amount: { type: number }
+                pay_method: { type: string, enum: [bank, alipay, wechat, usdt] }
+                pay_proof_url: { type: string }
+      responses: { '201': { description: 返回待审核的充值单 } }
+
+  /api/buyer/usage:
+    get:
+      tags: [buyer]
+      summary: 调用明细（可按子密钥、模型、时间筛选）
+      security: [{ jwt: [] }]
+      parameters:
+        - { name: token_id, in: query, schema: { type: string } }
+        - { name: model, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses: { '200': { description: 列表，每项为 UsageLog 的买方视图（不含卖方字段） } }
+
+  /api/buyer/usage/summary:
+    get:
+      tags: [buyer]
+      summary: 用量汇总（按天 × 模型），给图表用
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+
+  /api/buyer/transactions:
+    get:
+      tags: [buyer]
+      summary: 钱包流水
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+
+  /api/buyer/disputes:
+    post:
+      tags: [buyer]
+      summary: 对某次调用或交付订单发起纠纷
+      security: [{ jwt: [] }]
+      responses: { '201': { description: OK } }
+
+  /api/buyer/demands:
+    post:
+      tags: [buyer]
+      summary: 发布求购单（V2）
+      security: [{ jwt: [] }]
+      responses: { '201': { description: OK } }
+
+  /api/buyer/delivery-orders:
+    get:
+      tags: [buyer]
+      summary: 我的 Key 交付订单（V2）
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+  /api/buyer/delivery-orders/{id}/confirm:
+    post:
+      tags: [buyer]
+      summary: 确认收货，进入观察期（V2）
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  # =====================================================================
+  # 4. 卖方控制台
+  # =====================================================================
+  /api/seller/apply:
+    post:
+      tags: [seller]
+      summary: 申请成为卖方（填 Key 来源说明、收款方式）
+      security: [{ jwt: [] }]
+      responses: { '201': { description: 进入 pending_review } }
+
+  /api/seller/keys:
+    get:
+      tags: [seller]
+      summary: 我托管的 Key（状态、7 天成功率、今日用量）
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+    post:
+      tags: [seller]
+      summary: 上传 Key 托管
+      description: |
+        服务端立即做三件事：
+          1. 加密入库，算指纹去重
+          2. 异步验 Key：列模型、发一个最小请求、读额度（如果上游支持）
+          3. 验证通过 → status=active，并返回该 Key 可服务的模型列表供挂单
+      security: [{ jwt: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider_id, secret]
+              properties:
+                provider_id: { type: string, example: bytedance_volc }
+                label: { type: string }
+                secret: { type: string, description: 原始 Key，仅传输一次 }
+                extra_auth: { type: object, description: Bedrock 等需要的附加凭证 }
+                base_url_override: { type: string }
+                daily_cap_usd: { type: number }
+      responses:
+        '202':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderKey' }
+  /api/seller/keys/{id}:
+    get:
+      tags: [seller]
+      summary: Key 详情 + 验证结果 + 最近探活
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+    patch:
+      tags: [seller]
+      summary: 暂停/恢复、改日上限
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+    delete:
+      tags: [seller]
+      summary: 下架并销毁密文（未结算收益照常结算）
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: OK } }
+  /api/seller/keys/{id}/revalidate:
+    post:
+      tags: [seller]
+      summary: 手动触发一次验证
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '202': { description: OK } }
+
+  /api/seller/listings:
+    get:
+      tags: [seller]
+      summary: 我的挂单
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+    post:
+      tags: [seller]
+      summary: 挂单：用某个 Key 以某结算折扣提供某模型
+      security: [{ jwt: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key_id, model_id, settle_discount]
+              properties:
+                key_id: { type: string }
+                model_id: { type: string }
+                settle_discount: { type: number, example: 0.6 }
+      responses: { '201': { description: OK } }
+  /api/seller/listings/{id}:
+    patch:
+      tags: [seller]
+      summary: 改折扣 / 暂停 / 恢复
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/seller/market-hint:
+    get:
+      tags: [seller]
+      summary: 挂单辅助：某模型当前在线卖方数、结算折扣区间、近 7 天需求量
+      security: [{ jwt: [] }]
+      parameters: [{ name: model_id, in: query, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/seller/earnings:
+    get:
+      tags: [seller]
+      summary: 收益：今日 / 本期 / 累计，按模型和按日
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+  /api/seller/usage:
+    get:
+      tags: [seller]
+      summary: 我的 Key 被调用的明细（买方字段脱敏）
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+
+  /api/seller/settlements:
+    get:
+      tags: [seller]
+      summary: 结算单列表（每期一张）
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+  /api/seller/settlements/{id}:
+    get:
+      tags: [seller]
+      summary: 结算单详情（含扣款明细）
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/seller/payouts:
+    get:
+      tags: [seller]
+      summary: 提现记录
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+    post:
+      tags: [seller]
+      summary: 申请提现（从 pending_payout）
+      security: [{ jwt: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: number }
+      responses: { '201': { description: OK } }
+
+  /api/seller/deposit:
+    get:
+      tags: [seller]
+      summary: 保证金余额与要求
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+    post:
+      tags: [seller]
+      summary: 缴纳保证金（V1 线下 + 审核）
+      security: [{ jwt: [] }]
+      responses: { '201': { description: OK } }
+
+  /api/seller/delivery-orders:
+    post:
+      tags: [seller]
+      summary: 创建 Key 交付担保订单（V2）
+      security: [{ jwt: [] }]
+      responses: { '201': { description: OK } }
+  /api/seller/delivery-orders/{id}/deliver:
+    post:
+      tags: [seller]
+      summary: 交付 Key/账号（加密存入，平台自动验证）（V2）
+      security: [{ jwt: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/seller/demands:
+    get:
+      tags: [seller]
+      summary: 与我的 Key 匹配的求购单（V2）
+      security: [{ jwt: [] }]
+      responses: { '200': { description: OK } }
+
+  # =====================================================================
+  # 5. 平台后台
+  # =====================================================================
+  /api/admin/dashboard:
+    get:
+      tags: [admin]
+      summary: 今日 GMV、毛利、调用数、在线 Key、待审核数
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/users:
+    get:
+      tags: [admin]
+      summary: 用户列表（筛选角色、状态、信用分）
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+  /api/admin/users/{id}:
+    patch:
+      tags: [admin]
+      summary: 改状态 / 等级 / 手动调信用分
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/sellers/pending:
+    get:
+      tags: [admin]
+      summary: 待审核卖方
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+  /api/admin/sellers/{id}/review:
+    post:
+      tags: [admin]
+      summary: 审核卖方（通过 / 拒绝，设保证金要求与结算周期）
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/topups:
+    get:
+      tags: [admin]
+      summary: 待审核充值单
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+  /api/admin/topups/{id}/review:
+    post:
+      tags: [admin]
+      summary: 审核充值（通过 → 入账 + 流水 + 首充奖励）
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/payouts:
+    get:
+      tags: [admin]
+      summary: 待处理提现
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+  /api/admin/payouts/{id}/review:
+    post:
+      tags: [admin]
+      summary: 审核 / 标记已打款（上传凭证）
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/models:
+    get:
+      tags: [admin]
+      summary: 模型目录
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+    post:
+      tags: [admin]
+      summary: 新增模型（官方价、计费方式、上游模型名）
+      security: [{ jwt: [admin] }]
+      responses: { '201': { description: OK } }
+  /api/admin/models/{id}:
+    patch:
+      tags: [admin]
+      summary: 改官方价 / 上下架 / 推荐位
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/pricing-rules:
+    get:
+      tags: [admin]
+      summary: 售价规则
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+    post:
+      tags: [admin]
+      summary: 新增规则（模型 × 买方等级 × 时段 → 售价折扣）
+      security: [{ jwt: [admin] }]
+      responses: { '201': { description: OK } }
+
+  /api/admin/keys:
+    get:
+      tags: [admin]
+      summary: 所有托管 Key（脱敏）：状态、成功率、今日用量、卖方信用
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+  /api/admin/keys/{id}/status:
+    post:
+      tags: [admin]
+      summary: 强制暂停 / 恢复 / 标记失效（触发扣款流程）
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/listings/{id}/weight:
+    patch:
+      tags: [admin]
+      summary: 调路由权重
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/settlements/run:
+    post:
+      tags: [admin]
+      summary: 手动触发结算批次（默认每日 02:00 定时跑）
+      security: [{ jwt: [admin] }]
+      responses: { '202': { description: OK } }
+  /api/admin/settlements/{id}/hold:
+    post:
+      tags: [admin]
+      summary: 冻结 / 解冻某期结算
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/deductions:
+    post:
+      tags: [admin]
+      summary: 手动对卖方扣款（记入当期结算）
+      security: [{ jwt: [admin] }]
+      responses: { '201': { description: OK } }
+
+  /api/admin/disputes:
+    get:
+      tags: [admin]
+      summary: 纠纷列表
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+  /api/admin/disputes/{id}/resolve:
+    post:
+      tags: [admin]
+      summary: 裁决（退款 / 扣卖方 / 驳回），自动写钱包流水与信用事件
+      security: [{ jwt: [admin] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/configs:
+    get:
+      tags: [admin]
+      summary: 系统配置（汇率、默认折扣、结算周期、预留比例…）
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+    put:
+      tags: [admin]
+      summary: 修改配置（写审计日志）
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+
+  /api/admin/feed:
+    post:
+      tags: [admin]
+      summary: 手动发一条首页动态（例如公告）
+      security: [{ jwt: [admin] }]
+      responses: { '201': { description: OK } }
+
+  /api/admin/audit-logs:
+    get:
+      tags: [admin]
+      summary: 审计日志
+      security: [{ jwt: [admin] }]
+      responses: { '200': { description: OK } }
+
+  # =====================================================================
+  # 6. 公开接口（无需登录）
+  # =====================================================================
+  /api/public/models:
+    get:
+      tags: [public]
+      summary: 模型市场：售价折扣、在线卖方数、7 天可用率（读 v_market_models）
+      parameters:
+        - { name: kind, in: query, schema: { type: string, enum: [text, video, image, audio, embedding] } }
+        - { name: provider, in: query, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string } }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MarketModel' }
+  /api/public/models/{id}:
+    get:
+      tags: [public]
+      summary: 模型详情 + 价格计算器所需字段 + 近 7 天可用率曲线
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+  /api/public/models/{id}/health:
+    get:
+      tags: [public]
+      summary: 近 7 天每小时成功率与平均延迟（读 usage_hourly）
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK } }
+
+  /api/public/stats:
+    get:
+      tags: [public]
+      summary: 首页数字：在线模型数、在线卖方数、今日调用量、累计成交额区间
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  online_models: { type: integer }
+                  online_sellers: { type: integer }
+                  today_requests: { type: integer }
+                  gmv_band: { type: string, example: '100 万 – 500 万元' }
+                  includes_demo: { type: boolean, description: 当前统计里是否含演示数据 }
+
+  /api/public/feed:
+    get:
+      tags: [public]
+      summary: 首页滚动动态（脱敏；演示数据带 is_demo 标记，前端显示"演示"角标）
+      parameters: [{ name: limit, in: query, schema: { type: integer, default: 30 } }]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FeedItem' }
+
+  /api/public/demands:
+    get:
+      tags: [public]
+      summary: 公开的求购单（V2）
+      responses: { '200': { description: OK } }
+
+components:
+  securitySchemes:
+    apiToken:
+      type: http
+      scheme: bearer
+      description: 平台子密钥 sk-plat-...
+    jwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        role: { type: string, enum: [buyer, seller, both, admin] }
+        status: { type: string }
+        nickname: { type: string }
+        credit_score: { type: integer }
+        is_demo: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    Wallet:
+      type: object
+      properties:
+        balance: { type: number }
+        frozen: { type: number }
+        pending_payout: { type: number }
+        currency: { type: string }
+        today_cost: { type: number }
+
+    MarketModel:
+      type: object
+      properties:
+        id: { type: string }
+        display_name: { type: string }
+        provider_id: { type: string }
+        kind: { type: string }
+        billing_mode: { type: string }
+        official_input_usd: { type: number, nullable: true }
+        official_output_usd: { type: number, nullable: true }
+        official_unit_usd: { type: number, nullable: true }
+        sell_discount: { type: number, description: 买方售价折扣 }
+        online_sellers: { type: integer }
+        availability_7d: { type: number }
+        is_featured: { type: boolean }
+        is_demo: { type: boolean }
+
+    ProviderKey:
+      type: object
+      properties:
+        id: { type: string }
+        provider_id: { type: string }
+        label: { type: string }
+        status: { type: string, enum: [validating, active, paused, exhausted, dead, removed] }
+        daily_cap_usd: { type: number, nullable: true }
+        used_today_usd: { type: number }
+        success_rate_7d: { type: number, nullable: true }
+        avg_latency_ms_7d: { type: integer, nullable: true }
+        supported_models: { type: array, items: { type: string } }
+        last_probe_at: { type: string, format: date-time, nullable: true }
+
+    UsageLogBuyerView:
+      type: object
+      description: 买方看到的调用记录，不含任何卖方字段
+      properties:
+        request_id: { type: string }
+        created_at: { type: string, format: date-time }
+        model_id: { type: string }
+        input_tokens: { type: integer, nullable: true }
+        output_tokens: { type: integer, nullable: true }
+        units: { type: number, nullable: true }
+        cost_cny: { type: number }
+        status: { type: string }
+        latency_ms: { type: integer }
+
+    UsageLogSellerView:
+      type: object
+      description: 卖方看到的调用记录，不含买方身份
+      properties:
+        request_id: { type: string }
+        created_at: { type: string, format: date-time }
+        model_id: { type: string }
+        key_label: { type: string }
+        official_cost_usd: { type: number }
+        earning_cny: { type: number }
+        status: { type: string }
+
+    Settlement:
+      type: object
+      properties:
+        id: { type: string }
+        period_start: { type: string, format: date }
+        period_end: { type: string, format: date }
+        gross_earning: { type: number }
+        deduction: { type: number }
+        fee: { type: number }
+        payable: { type: number }
+        status: { type: string, enum: [open, closed, payable, paid, held] }
+        payable_at: { type: string, format: date-time, nullable: true }
+        paid_at: { type: string, format: date-time, nullable: true }
+
+    FeedItem:
+      type: object
+      properties:
+        id: { type: integer }
+        type: { type: string }
+        display_text: { type: string }
+        model_id: { type: string, nullable: true }
+        amount_band: { type: string, nullable: true }
+        is_demo: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: insufficient_balance }
+            message: { type: string }
+            request_id: { type: string }
